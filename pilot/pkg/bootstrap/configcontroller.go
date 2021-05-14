@@ -15,7 +15,12 @@
 package bootstrap
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"istio.io/istio/pkg/kube"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/clientcmd"
 	"net/url"
 	"time"
 
@@ -191,7 +196,7 @@ func (s *Server) initConfigSources(args *PilotArgs) (err error) {
 			s.ConfigStores = append(s.ConfigStores, configController)
 			log.Warn("Started XDS config ", s.ConfigStores)
 		case Kubernetes:
-			if srcAddress.Path == "" || srcAddress.Path == "/" {
+			if srcAddress.Host == "local" {
 				err2 := s.initK8SConfigStore(args)
 				if err2 != nil {
 					log.Warn("Error loading k8s ", err2)
@@ -199,15 +204,60 @@ func (s *Server) initConfigSources(args *PilotArgs) (err error) {
 				}
 				log.Warn("Started K8S config")
 			} else {
-				log.Warnf("Not implemented, ignore: %v", configSource.Address)
-				// TODO: handle k8s:// scheme for remote cluster. Use same mechanism as service registry,
-				// using the cluster name as key to match a secret.
+				log.Infof("Starting K8S config: %v", configSource.Address)
+				secretName := srcAddress.Host
+				secret, err := s.kubeClient.CoreV1().Secrets(args.Namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
+				if err != nil {
+					log.Errorf("get secret %v failed: %w", secretName, err)
+					continue
+				}
+				for clusterID, kubeConfig := range secret.Data {
+					log.Infof("add configSource %v from secret %v", clusterID, secretName)
+					clients, err := BuildClientsFromConfig(kubeConfig)
+					if err != nil {
+						log.Errorf("build client from secret %v error:  %w", secretName, err)
+						continue
+					}
+
+					configController, err := crdclient.New(clients, args.Revision, args.RegistryOptions.KubeOptions.DomainSuffix)
+					if err != nil {
+						log.Errorf("build crdclient from secret  %v error:  %w", secretName, err)
+						continue
+					}
+					s.remoteClusterKubeClients = append(s.remoteClusterKubeClients, clients)
+					s.ConfigStores = append(s.ConfigStores, configController)
+
+				}
+				log.Infof("Started K8S config: %v", configSource.Address)
 			}
 		default:
 			log.Warnf("Ignoring unsupported config source: %v", configSource.Address)
 		}
 	}
 	return nil
+}
+
+var BuildClientsFromConfig = func(kubeConfig []byte) (kube.Client, error) {
+	if len(kubeConfig) == 0 {
+		return nil, errors.New("kubeconfig is empty")
+	}
+
+	rawConfig, err := clientcmd.Load(kubeConfig)
+	if err != nil {
+		return nil, fmt.Errorf("kubeconfig cannot be loaded: %v", err)
+	}
+
+	if err := clientcmd.Validate(*rawConfig); err != nil {
+		return nil, fmt.Errorf("kubeconfig is not valid: %v", err)
+	}
+
+	clientConfig := clientcmd.NewDefaultClientConfig(*rawConfig, &clientcmd.ConfigOverrides{})
+
+	clients, err := kube.NewClient(clientConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kube clients: %v", err)
+	}
+	return clients, nil
 }
 
 // initInprocessAnalysisController spins up an instance of Galley which serves no purpose other than

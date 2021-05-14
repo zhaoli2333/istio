@@ -116,8 +116,9 @@ type Server struct {
 	clusterID   string
 	environment *model.Environment
 
-	kubeRestConfig *rest.Config
-	kubeClient     kubelib.Client
+	kubeRestConfig           *rest.Config
+	kubeClient               kubelib.Client
+	remoteClusterKubeClients []kubelib.Client
 
 	multicluster *kubecontroller.Multicluster
 
@@ -336,6 +337,15 @@ func NewServer(args *PilotArgs) (*Server, error) {
 			s.kubeClient.RunAndWait(stop)
 			return nil
 		})
+	}
+
+	if len(s.remoteClusterKubeClients) > 0 {
+		for _, remoteClusterKubeClient := range s.remoteClusterKubeClients {
+			s.addStartFunc(func(stop <-chan struct{}) error {
+				remoteClusterKubeClient.RunAndWait(stop)
+				return nil
+			})
+		}
 	}
 
 	s.addReadinessProbe("discovery", func() (bool, error) {
